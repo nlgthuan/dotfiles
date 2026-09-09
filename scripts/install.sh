@@ -29,6 +29,7 @@ is_excluded() {
 mkdir -p "$TARGET_DIR/.config"
 mkdir -p "$TARGET_DIR/.local/bin"
 
+conflicts=0
 link_item() {
     local src="$1"
     local dest="$2"
@@ -43,6 +44,7 @@ link_item() {
 
         # Otherwise, report error and skip
         echo "[SKIP] Target already exists: $dest" >&2
+        conflicts=$((conflicts + 1))
         return 0
     fi
 
@@ -93,3 +95,8 @@ for source_path in "$DOTFILES_DIR"/.* "$DOTFILES_DIR"/*; do
 done
 
 echo "Finished processing dotfiles."
+
+if (( conflicts > 0 )); then
+    echo "Encountered $conflicts conflict(s)." >&2
+    exit 1
+fi

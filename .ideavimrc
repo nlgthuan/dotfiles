@@ -1,0 +1,6 @@
+let mapleader = " "
+
+imap <C-y> <Action>(EditorChooseLookupItem)
+nnoremap <leader>f :action ReformatCode<CR>
+nnoremap <leader>r :action RecentFiles<CR>
+

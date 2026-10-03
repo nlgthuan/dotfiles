@@ -36,8 +36,15 @@ tmux session, Fork tab and IntelliJ window.
 Commands:
   (none)            run the ticket picker on the stored tickets
                     (fetches them first if none are stored yet)
+                    enter: start, ctrl-o: open in Jira, ctrl-r: refresh from Jira
+  <number>, TS-<number>
+                    start that ticket directly, without the picker
   fetch             fetch your tickets from Jira and store them in
                     $TICKETS_FILE
+  open [ticket]     open the ticket in the browser (default: the ticket of the
+                    current worktree's branch)
+  clean             pick worktrees to remove, together with their branch and
+                    tmux session
   healthcheck       check required tools, repository and Jira credentials
   help, -h, --help  show this help
 
@@ -56,9 +63,23 @@ load_jira_credentials() {
 	jira_token="${JIRA_API_TOKEN:-$(security find-generic-password -s jira-api-token -w 2>/dev/null || true)}"
 }
 
+require_jira_credentials() {
+	load_jira_credentials
+	[[ -n "$jira_email" && -n "$jira_token" ]] || die "missing Jira credentials; run 'ts healthcheck'"
+}
+
 # curl with Jira credentials, passed as config on stdin to keep the token out of `ps`.
 jira_curl() {
 	printf 'user = "%s:%s"\n' "$jira_email" "$jira_token" | curl -K - "$@"
+}
+
+# Turns "123", "TS-123" or "ts-123" into "TS-123"; fails for anything else.
+parse_key() {
+	local number
+	number=$(tr '[:lower:]' '[:upper:]' <<<"$1")
+	number="${number#TS-}"
+	[[ "$number" =~ ^[0-9]+$ ]] || return 1
+	echo "TS-$number"
 }
 
 # Prints the worktree path of the first branch ts/<number>_*, if any.
@@ -67,6 +88,12 @@ find_worktree() {
 	awk -v prefix="branch refs/heads/ts/$1_" '
 		/^worktree / { path = substr($0, 10) }
 		index($0, prefix) == 1 { print path; exit }'
+}
+
+# Prints the stored status of a ticket, if it is among the stored tickets.
+stored_status() {
+	[[ -f "$TICKETS_FILE" ]] || return 0
+	awk -F'\t' -v k="$1" '$1 == k { print $2 }' "$TICKETS_FILE"
 }
 
 # Turns a summary into a short_name: drops a "Component:" prefix, keeps 3 words.
@@ -124,8 +151,7 @@ healthcheck() {
 
 # Stores the tickets as "<key>\t<status>\t<summary>" lines in $TICKETS_FILE.
 fetch() {
-	load_jira_credentials
-	[[ -n "$jira_email" && -n "$jira_token" ]] || die "missing Jira credentials; run 'ts healthcheck'"
+	require_jira_credentials
 
 	local response
 	response=$(jira_curl -fsS \
@@ -146,47 +172,150 @@ fetch() {
 	echo "Stored $(wc -l <"$TICKETS_FILE" | tr -d ' ') tickets in $TICKETS_FILE"
 }
 
+# --- open --------------------------------------------------------------------
+
+open_ticket() {
+	local key branch
+	if [[ -n "$1" ]]; then
+		key=$(parse_key "$1") || die "not a ticket: $1"
+	else
+		branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || die "not in a git repository; pass a ticket"
+		[[ "$branch" =~ ^ts/([0-9]+)_ ]] || die "branch '$branch' is not a ts/<number>_<name> branch; pass a ticket"
+		key="TS-${BASH_REMATCH[1]}"
+	fi
+	open "$JIRA_URL/browse/$key"
+}
+
+# --- clean -------------------------------------------------------------------
+
+clean() {
+	local current_session=""
+	if [[ -n "${TMUX:-}" ]]; then
+		current_session=$(tmux display-message -p '#S')
+	fi
+
+	# One line per ts worktree: hidden "<order>\t<path>\t<branch>\t" fields, then the
+	# visible text. Worktrees whose ticket is no longer among the stored tickets come first.
+	local candidates="" path branch name key status notes order
+	while IFS=$'\t' read -r path branch; do
+		name="${branch#ts/}"
+		key="TS-${name%%_*}"
+		status=$(stored_status "$key")
+		notes=""
+		[[ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]] && notes+=" modified"
+		[[ -n "$(git -C "$MAIN_REPO" log --oneline "$branch" --not --remotes)" ]] && notes+=" unpushed"
+		if [[ -n "$status" ]]; then order=1; status="[$status]"; else order=0; status="[not in your tickets]"; fi
+		candidates+="$order"$'\t'"$path"$'\t'"$branch"$'\t'"$(printf '%-9s %-24s %-40s%s' "$key" "$status" "$name" "$notes")"$'\n'
+	done < <(git -C "$MAIN_REPO" worktree list --porcelain | awk '
+		/^worktree / { path = substr($0, 10) }
+		/^branch refs\/heads\/ts\// { print path "\t" substr($0, 19) }')
+
+	[[ -n "$candidates" ]] || { echo "No ts worktrees to clean."; return 0; }
+
+	local selection
+	selection=$(printf '%s' "$candidates" | sort -t$'\t' -k1,1 -s | fzf --multi \
+		--prompt='clean> ' --height=40% --reverse --delimiter=$'\t' --with-nth=4.. \
+		--header='tab: select, enter: remove selected · modified/unpushed ones are kept') || exit 0
+
+	local count answer
+	count=$(wc -l <<<"$selection" | tr -d ' ')
+	read -r -p "Remove $count worktree(s) with their branch and tmux session? [y/N] " answer
+	[[ "$answer" == [yY] ]] || exit 0
+
+	while IFS=$'\t' read -r order path branch _; do
+		name=$(basename "$path")
+		if [[ "$PWD" == "$path" || "$PWD" == "$path"/* ]]; then
+			echo "Skipping $name: you are inside it"
+			continue
+		fi
+		# Only delete branches whose commits all exist on a remote, so no work is lost.
+		if [[ -n "$(git -C "$MAIN_REPO" log --oneline "$branch" --not --remotes)" ]]; then
+			echo "Skipping $name: $branch has commits that are not pushed"
+			continue
+		fi
+		if ! git -C "$MAIN_REPO" worktree remove "$path"; then
+			echo "Skipping $name: could not remove the worktree"
+			continue
+		fi
+		git -C "$MAIN_REPO" branch -D "$branch" >/dev/null
+		if [[ "$name" == "$current_session" ]]; then
+			echo "Removed $name; kill its tmux session yourself after switching away"
+		else
+			tmux kill-session -t "=$name" 2>/dev/null || true
+			echo "Removed $name"
+		fi
+	done <<<"$selection"
+	echo "Close their IntelliJ windows and Fork tabs yourself."
+}
+
 # --- main feature ------------------------------------------------------------
 
-run() {
-	# 1. Pick a ticket
+# Prints the picker lines: a hidden "<key>\t" field, then the visible text.
+# Tickets that already have a worktree are marked.
+ticket_listing() {
+	local worktrees key status summary marker
+	worktrees=$(git -C "$MAIN_REPO" worktree list --porcelain)
+	while IFS=$'\t' read -r key status summary; do
+		marker=" "
+		[[ -n "$(find_worktree "${key#*-}" <<<"$worktrees")" ]] && marker="●"
+		printf '%s\t%s %-9s %-16s %s\n' "$key" "$marker" "$key" "[$status]" "$summary"
+	done <"$TICKETS_FILE"
+}
 
+picker_header() {
+	echo "● = worktree exists · ctrl-o: open in Jira · ctrl-r: refresh · fetched $(stat -f '%Sm' -t '%a %H:%M' "$TICKETS_FILE")"
+}
+
+# Used by ctrl-r in the picker: fetches, then prints the new header.
+refresh_header() {
+	# Subshell, because fetch exits the script on errors.
+	if (fetch) >/dev/null 2>&1; then
+		picker_header
+	else
+		echo "Refresh failed, run 'ts healthcheck' · $(picker_header)"
+	fi
+}
+
+pick() {
 	if [[ ! -s "$TICKETS_FILE" ]]; then
 		echo "No stored tickets yet, fetching them from Jira..."
 		fetch
 	fi
-	local tickets
-	tickets=$(<"$TICKETS_FILE")
 
-	# Mark tickets that already have a worktree. Each line starts with a hidden
-	# "<key>\t" field so the selection can be parsed regardless of the marker.
-	local worktrees
-	worktrees=$(git -C "$MAIN_REPO" worktree list --porcelain)
-	local listing="" key status summary marker
-	while IFS=$'\t' read -r key status summary; do
-		marker=" "
-		[[ -n "$(find_worktree "${key#*-}" <<<"$worktrees")" ]] && marker="●"
-		listing+="$key"$'\t'"$(printf '%s %-9s %-16s %s' "$marker" "$key" "[$status]" "$summary")"$'\n'
-	done <<<"$tickets"
+	local self url selection
+	self=$(printf '%q' "${BASH_SOURCE[0]}")
+	url=$(printf '%q' "$JIRA_URL")
+	selection=$(ticket_listing | fzf --prompt='ticket> ' --height=40% --reverse \
+		--delimiter=$'\t' --with-nth=2.. --header="$(picker_header)" \
+		--bind "ctrl-o:execute-silent(open $url/browse/{1})" \
+		--bind "ctrl-r:transform-header($self _refresh-header)+reload($self _listing)") || exit 0
 
-	local selection
-	selection=$(printf '%s' "$listing" | fzf --prompt='ticket> ' --height=40% --reverse \
-		--delimiter=$'\t' --with-nth=2.. --header='● = worktree exists') || exit 0
+	start "${selection%%$'\t'*}"
+}
 
-	key=${selection%%$'\t'*}
+# Creates or reuses the worktree, tmux session, Fork tab and IntelliJ window of a ticket.
+start() {
+	local key="$1"
 	local number="${key#*-}"
-	summary=$(awk -F'\t' -v k="$key" '$1 == k {print $3}' <<<"$tickets")
 
-	# 2. Worktree
+	# 1. Worktree
 
 	local worktree
-	worktree=$(find_worktree "$number" <<<"$worktrees")
+	worktree=$(find_worktree "$number" <<<"$(git -C "$MAIN_REPO" worktree list --porcelain)")
 	if [[ -n "$worktree" ]]; then
 		echo "Reusing worktree $worktree"
 	else
+		local summary
+		summary=$([[ -f "$TICKETS_FILE" ]] && awk -F'\t' -v k="$key" '$1 == k { print $3 }' "$TICKETS_FILE" || true)
+		if [[ -z "$summary" ]]; then
+			require_jira_credentials
+			summary=$(jira_curl -fsS "$JIRA_URL/rest/api/3/issue/$key?fields=summary" | jq -r '.fields.summary') \
+				|| die "could not find $key in Jira"
+		fi
+
 		local default_name short_name
 		default_name=$(slugify "$summary")
-		read -r -p "Short name for $key [$default_name]: " short_name
+		read -r -p "Short name for $key ($summary) [$default_name]: " short_name
 		short_name="${short_name:-$default_name}"
 		short_name=$(echo "$short_name" | tr '[:upper:] -' '[:lower:]__')
 		[[ "$short_name" =~ ^[a-z0-9_]+$ ]] || die "short name may only contain a-z, 0-9 and _"
@@ -207,7 +336,7 @@ run() {
 	local session
 	session=$(basename "$worktree")
 
-	# 3. tmux session
+	# 2. tmux session
 
 	if tmux has-session -t "=$session" 2>/dev/null; then
 		echo "Reusing tmux session $session"
@@ -217,7 +346,7 @@ run() {
 		tmux select-pane -t "=$session:.0"
 	fi
 
-	# 4. Fork, then IntelliJ last
+	# 3. Fork, then IntelliJ last
 
 	fork -C "$worktree" open >/dev/null 2>&1 || echo "ts: could not open Fork" >&2
 	idea "$worktree" >/dev/null 2>&1 &
@@ -230,9 +359,20 @@ run() {
 }
 
 case "${1:-}" in
-	"") run ;;
+	"") pick ;;
 	fetch) fetch ;;
+	open) open_ticket "${2:-}" ;;
+	clean) clean ;;
 	healthcheck) healthcheck ;;
 	help | -h | --help) usage ;;
-	*) usage >&2; echo >&2; die "unknown command '$1'" ;;
+	# Internal, used by the picker's key bindings.
+	_listing) ticket_listing ;;
+	_refresh-header) refresh_header ;;
+	*)
+		if key=$(parse_key "$1"); then
+			start "$key"
+		else
+			usage >&2; echo >&2; die "unknown command '$1'"
+		fi
+		;;
 esac

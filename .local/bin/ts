@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+#
+# ts: pick one of my Jira tickets with fzf, then create or reuse
+# its git worktree, tmux session, Fork tab and IntelliJ window.
+#
+#   branch:   ts/<number>_<short_name>
+#   worktree: $TS_ROOT/worktrees/<number>_<short_name>
+#   tmux:     session <number>_<short_name>, two side-by-side panes
+#
+# Jira credentials:
+#   JIRA_EMAIL      defaults to `git config user.email`
+#   JIRA_API_TOKEN  or a keychain entry, created once by copying the token and running:
+#                   security add-generic-password -U -a "$USER" -s jira-api-token -w "$(pbpaste)"
+#                   (not the interactive -w prompt: it truncates input to 128 characters)
+#                   (token from https://id.atlassian.com/manage-profile/security/api-tokens)
+
+set -euo pipefail
+
+TS_ROOT="${TS_ROOT:-$HOME/work/teamscale}"
+MAIN_REPO="$TS_ROOT/repository"
+WORKTREES_DIR="$TS_ROOT/worktrees"
+JIRA_URL="${JIRA_URL:-https://cqse.atlassian.net}"
+JIRA_JQL="${JIRA_JQL:-assignee = currentUser() AND project = TS AND status in (Backlog, \"In Development\", \"In Review\", Rework) ORDER BY updated DESC}"
+REQUIRED_TOOLS=(git tmux fzf jq curl idea fork)
+
+die() { echo "ts: $*" >&2; exit 1; }
+
+usage() {
+	cat <<EOF
+Usage: ts [command]
+
+Pick one of your Jira tickets with fzf, then create or reuse its git worktree,
+tmux session, Fork tab and IntelliJ window.
+
+Commands:
+  (none)            run the ticket picker
+  healthcheck       check required tools, repository and Jira credentials
+  help, -h, --help  show this help
+
+Environment:
+  TS_ROOT           teamscale folder (default: ~/work/teamscale)
+  JIRA_URL          Jira site (default: https://cqse.atlassian.net)
+  JIRA_JQL          ticket query (default: your TS tickets in Backlog,
+                    In Development, In Review or Rework)
+  JIRA_EMAIL        Jira login (default: git config user.email)
+  JIRA_API_TOKEN    Jira API token (default: keychain entry 'jira-api-token')
+EOF
+}
+
+load_jira_credentials() {
+	jira_email="${JIRA_EMAIL:-$(git config user.email || true)}"
+	jira_token="${JIRA_API_TOKEN:-$(security find-generic-password -s jira-api-token -w 2>/dev/null || true)}"
+}
+
+# curl with Jira credentials, passed as config on stdin to keep the token out of `ps`.
+jira_curl() {
+	printf 'user = "%s:%s"\n' "$jira_email" "$jira_token" | curl -K - "$@"
+}
+
+# Prints the worktree path of the first branch ts/<number>_*, if any.
+# Reads `git worktree list --porcelain` output from stdin.
+find_worktree() {
+	awk -v prefix="branch refs/heads/ts/$1_" '
+		/^worktree / { path = substr($0, 10) }
+		index($0, prefix) == 1 { print path; exit }'
+}
+
+# Turns a summary into a short_name: drops a "Component:" prefix, keeps 3 words.
+slugify() {
+	echo "$1" | sed -E 's/^[^:]{1,30}: *//' | tr '[:upper:]' '[:lower:]' \
+		| sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//' | cut -d_ -f1-3
+}
+
+# --- healthcheck -------------------------------------------------------------
+
+healthcheck() {
+	local failures=0
+	ok() { printf '  \033[32m✓\033[0m %s\n' "$1"; }
+	fail() { printf '  \033[31m✗\033[0m %s\n' "$1"; failures=$((failures + 1)); }
+
+	echo "Tools"
+	for cmd in "${REQUIRED_TOOLS[@]}"; do
+		if command -v "$cmd" >/dev/null; then ok "$cmd"; else fail "$cmd not found on PATH"; fi
+	done
+
+	echo "Repository"
+	if git -C "$MAIN_REPO" rev-parse --git-dir >/dev/null 2>&1; then
+		ok "main repository $MAIN_REPO"
+	else
+		fail "no git repository at $MAIN_REPO (set TS_ROOT)"
+	fi
+	if [[ -d "$WORKTREES_DIR" ]]; then ok "worktrees folder $WORKTREES_DIR"; else fail "missing $WORKTREES_DIR"; fi
+
+	echo "Jira"
+	load_jira_credentials
+	if [[ -n "$jira_email" ]]; then ok "email $jira_email"; else fail "no email (set JIRA_EMAIL)"; fi
+	if [[ -z "$jira_token" ]]; then
+		fail "no API token (set JIRA_API_TOKEN or add the 'jira-api-token' keychain entry, see header of $0)"
+	else
+		ok "API token found (${#jira_token} characters)"
+		local status
+		status=$(jira_curl -sS -o /dev/null -w '%{http_code}' "$JIRA_URL/rest/api/3/myself" 2>/dev/null) || status="unreachable"
+		if [[ "$status" == 200 ]]; then
+			ok "authenticated at $JIRA_URL"
+		else
+			fail "authentication at $JIRA_URL failed (HTTP $status); the token is probably invalid, truncated or expired"
+		fi
+	fi
+
+	echo
+	if ((failures == 0)); then
+		echo "All checks passed."
+	else
+		echo "$failures check(s) failed."
+		return 1
+	fi
+}
+
+# --- main feature ------------------------------------------------------------
+
+run() {
+	load_jira_credentials
+	[[ -n "$jira_email" && -n "$jira_token" ]] || die "missing Jira credentials; run 'ts healthcheck'"
+
+	# 1. Pick a ticket
+
+	local response
+	response=$(jira_curl -fsS \
+		-H 'Content-Type: application/json' \
+		-X POST "$JIRA_URL/rest/api/3/search/jql" \
+		-d "$(jq -n --arg jql "$JIRA_JQL" '{jql: $jql, fields: ["summary", "status"], maxResults: 100}')") \
+		|| die "Jira request failed; run 'ts healthcheck'"
+
+	local tickets
+	tickets=$(jq -r '.issues[] | [.key, .fields.status.name, .fields.summary] | @tsv' <<<"$response")
+	# Jira answers searches with bad credentials as anonymous, which also gives an empty result.
+	[[ -n "$tickets" ]] || die "no tickets found; if that is unexpected, run 'ts healthcheck'"
+
+	# Mark tickets that already have a worktree. Each line starts with a hidden
+	# "<key>\t" field so the selection can be parsed regardless of the marker.
+	local worktrees
+	worktrees=$(git -C "$MAIN_REPO" worktree list --porcelain)
+	local listing="" key status summary marker
+	while IFS=$'\t' read -r key status summary; do
+		marker=" "
+		[[ -n "$(find_worktree "${key#*-}" <<<"$worktrees")" ]] && marker="●"
+		listing+="$key"$'\t'"$(printf '%s %-9s %-16s %s' "$marker" "$key" "[$status]" "$summary")"$'\n'
+	done <<<"$tickets"
+
+	local selection
+	selection=$(printf '%s' "$listing" | fzf --prompt='ticket> ' --height=40% --reverse \
+		--delimiter=$'\t' --with-nth=2.. --header='● = worktree exists') || exit 0
+
+	key=${selection%%$'\t'*}
+	local number="${key#*-}"
+	summary=$(awk -F'\t' -v k="$key" '$1 == k {print $3}' <<<"$tickets")
+
+	# 2. Worktree
+
+	local worktree
+	worktree=$(find_worktree "$number" <<<"$worktrees")
+	if [[ -n "$worktree" ]]; then
+		echo "Reusing worktree $worktree"
+	else
+		local default_name short_name
+		default_name=$(slugify "$summary")
+		read -r -p "Short name for $key [$default_name]: " short_name
+		short_name="${short_name:-$default_name}"
+		short_name=$(echo "$short_name" | tr '[:upper:] -' '[:lower:]__')
+		[[ "$short_name" =~ ^[a-z0-9_]+$ ]] || die "short name may only contain a-z, 0-9 and _"
+
+		local name="${number}_${short_name}"
+		local branch="ts/$name"
+		worktree="$WORKTREES_DIR/$name"
+
+		echo "Fetching origin/master..."
+		git -C "$MAIN_REPO" fetch origin master
+		if git -C "$MAIN_REPO" show-ref --verify --quiet "refs/heads/$branch"; then
+			git -C "$MAIN_REPO" worktree add "$worktree" "$branch"
+		else
+			git -C "$MAIN_REPO" worktree add --no-track -b "$branch" "$worktree" origin/master
+		fi
+	fi
+
+	local session
+	session=$(basename "$worktree")
+
+	# 3. tmux session
+
+	if tmux has-session -t "=$session" 2>/dev/null; then
+		echo "Reusing tmux session $session"
+	else
+		tmux new-session -d -s "$session" -c "$worktree"
+		tmux split-window -h -t "=$session:" -c "$worktree"
+		tmux select-pane -t "=$session:.0"
+	fi
+
+	# 4. Fork, then IntelliJ last
+
+	fork -C "$worktree" open >/dev/null 2>&1 || echo "ts: could not open Fork" >&2
+	idea "$worktree" >/dev/null 2>&1 &
+
+	if [[ -n "${TMUX:-}" ]]; then
+		tmux switch-client -t "=$session"
+	else
+		tmux attach-session -t "=$session"
+	fi
+}
+
+case "${1:-}" in
+	"") run ;;
+	healthcheck) healthcheck ;;
+	help | -h | --help) usage ;;
+	*) usage >&2; echo >&2; die "unknown command '$1'" ;;
+esac

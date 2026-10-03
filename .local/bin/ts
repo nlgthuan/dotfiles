@@ -21,6 +21,7 @@ MAIN_REPO="$TS_ROOT/repository"
 WORKTREES_DIR="$TS_ROOT/worktrees"
 JIRA_URL="${JIRA_URL:-https://cqse.atlassian.net}"
 JIRA_JQL="${JIRA_JQL:-assignee = currentUser() AND project = TS AND status in (Backlog, \"In Development\", \"In Review\", Rework) ORDER BY updated DESC}"
+TICKETS_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/ts/tickets.tsv"
 REQUIRED_TOOLS=(git tmux fzf jq curl idea fork)
 
 die() { echo "ts: $*" >&2; exit 1; }
@@ -33,7 +34,10 @@ Pick one of your Jira tickets with fzf, then create or reuse its git worktree,
 tmux session, Fork tab and IntelliJ window.
 
 Commands:
-  (none)            run the ticket picker
+  (none)            run the ticket picker on the stored tickets
+                    (fetches them first if none are stored yet)
+  fetch             fetch your tickets from Jira and store them in
+                    $TICKETS_FILE
   healthcheck       check required tools, repository and Jira credentials
   help, -h, --help  show this help
 
@@ -116,13 +120,12 @@ healthcheck() {
 	fi
 }
 
-# --- main feature ------------------------------------------------------------
+# --- fetch -------------------------------------------------------------------
 
-run() {
+# Stores the tickets as "<key>\t<status>\t<summary>" lines in $TICKETS_FILE.
+fetch() {
 	load_jira_credentials
 	[[ -n "$jira_email" && -n "$jira_token" ]] || die "missing Jira credentials; run 'ts healthcheck'"
-
-	# 1. Pick a ticket
 
 	local response
 	response=$(jira_curl -fsS \
@@ -134,7 +137,26 @@ run() {
 	local tickets
 	tickets=$(jq -r '.issues[] | [.key, .fields.status.name, .fields.summary] | @tsv' <<<"$response")
 	# Jira answers searches with bad credentials as anonymous, which also gives an empty result.
+	# Keep the stored tickets in that case.
 	[[ -n "$tickets" ]] || die "no tickets found; if that is unexpected, run 'ts healthcheck'"
+
+	mkdir -p "$(dirname "$TICKETS_FILE")"
+	printf '%s\n' "$tickets" >"$TICKETS_FILE.tmp"
+	mv "$TICKETS_FILE.tmp" "$TICKETS_FILE"
+	echo "Stored $(wc -l <"$TICKETS_FILE" | tr -d ' ') tickets in $TICKETS_FILE"
+}
+
+# --- main feature ------------------------------------------------------------
+
+run() {
+	# 1. Pick a ticket
+
+	if [[ ! -s "$TICKETS_FILE" ]]; then
+		echo "No stored tickets yet, fetching them from Jira..."
+		fetch
+	fi
+	local tickets
+	tickets=$(<"$TICKETS_FILE")
 
 	# Mark tickets that already have a worktree. Each line starts with a hidden
 	# "<key>\t" field so the selection can be parsed regardless of the marker.
@@ -209,6 +231,7 @@ run() {
 
 case "${1:-}" in
 	"") run ;;
+	fetch) fetch ;;
 	healthcheck) healthcheck ;;
 	help | -h | --help) usage ;;
 	*) usage >&2; echo >&2; die "unknown command '$1'" ;;

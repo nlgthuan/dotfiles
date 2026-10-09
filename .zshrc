@@ -215,4 +215,4 @@ export SDKMAN_DIR="$HOME/.sdkman"
   source "$SDKMAN_DIR/bin/sdkman-init.sh"
 
 # Local configuration
-[[ -f "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"
+if [[ -f "$HOME/.zshrc.local" ]]; then source "$HOME/.zshrc.local"; fi

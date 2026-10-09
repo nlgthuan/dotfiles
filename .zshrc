@@ -15,6 +15,7 @@ export ZSH="$HOME/.oh-my-zsh"
 
 ZSH_THEME="robbyrussell"
 ZSH_DISABLE_COMPFIX=true
+zstyle ':omz:update' mode disabled  # update manually with `omz update`
 
 plugins=(
   git
@@ -39,8 +40,13 @@ export PATH="$HOMEBREW_PREFIX/opt/libpq/bin:$PATH"
 
 # NVM
 export NVM_DIR="$HOME/.nvm"
-[[ -s "$HOMEBREW_PREFIX/opt/nvm/nvm.sh" ]] &&
+
+# Load nvm on first use; node is put on PATH below without it
+nvm() {
+  unfunction nvm
   source "$HOMEBREW_PREFIX/opt/nvm/nvm.sh" --no-use
+  nvm "$@"
+}
 
 # Put the default node on PATH without the slow `nvm use`
 _nvm_default="$(<"$NVM_DIR/alias/default" 2>/dev/null)"
@@ -48,9 +54,6 @@ _nvm_default="$NVM_DIR/versions/node/v${_nvm_default#v}"
 [[ -d "$_nvm_default/bin" ]] || _nvm_default=$(ls -d "$NVM_DIR"/versions/node/v* 2>/dev/null | tail -1)
 [[ -d "$_nvm_default/bin" ]] && export PATH="$_nvm_default/bin:$PATH"
 unset _nvm_default
-
-[[ -s "$HOMEBREW_PREFIX/opt/nvm/etc/bash_completion.d/nvm" ]] &&
-  source "$HOMEBREW_PREFIX/opt/nvm/etc/bash_completion.d/nvm"
 
 # SDKMAN
 export SDKMAN_DIR="$HOME/.sdkman"

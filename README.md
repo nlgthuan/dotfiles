@@ -2,6 +2,8 @@
 
 Personal configuration files and custom environment setup for Mac.
 
+![Benchmark](./hyperfine.png)
+
 ## Structure
 
 ```text

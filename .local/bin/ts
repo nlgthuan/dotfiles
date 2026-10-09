@@ -39,6 +39,8 @@ Commands:
                     enter: start, ctrl-o: open in Jira, ctrl-r: refresh from Jira
   <number>, TS-<number>
                     start that ticket directly, without the picker
+  master            open the main repository the same way (tmux session
+                    'master', Fork, IntelliJ); also the first picker entry
   fetch             fetch your tickets from Jira and store them in
                     $TICKETS_FILE
   open [ticket]     open the ticket in the browser (default: the ticket of the
@@ -255,6 +257,7 @@ clean() {
 ticket_listing() {
 	local worktrees key status summary marker
 	worktrees=$(git -C "$MAIN_REPO" worktree list --porcelain)
+	printf 'master\t● %-9s %-16s %s\n' "master" "[main]" "$MAIN_REPO"
 	while IFS=$'\t' read -r key status summary; do
 		marker=" "
 		[[ -n "$(find_worktree "${key#*-}" <<<"$worktrees")" ]] && marker="●"
@@ -287,10 +290,15 @@ pick() {
 	url=$(printf '%q' "$JIRA_URL")
 	selection=$(ticket_listing | fzf --prompt='ticket> ' --height=40% --reverse \
 		--delimiter=$'\t' --with-nth=2.. --header="$(picker_header)" \
-		--bind "ctrl-o:execute-silent(open $url/browse/{1})" \
+		--bind "ctrl-o:execute-silent([ {1} = master ] || open $url/browse/{1})" \
 		--bind "ctrl-r:transform-header($self _refresh-header)+reload($self _listing)") || exit 0
 
-	start "${selection%%$'\t'*}"
+	local key="${selection%%$'\t'*}"
+	if [[ "$key" == master ]]; then
+		open_workspace "$MAIN_REPO" master
+	else
+		start "$key"
+	fi
 }
 
 # Creates or reuses the worktree, tmux session, Fork tab and IntelliJ window of a ticket.
@@ -333,10 +341,14 @@ start() {
 		fi
 	fi
 
-	local session
-	session=$(basename "$worktree")
+	open_workspace "$worktree" "$(basename "$worktree")"
+}
 
-	# 2. tmux session
+# Creates or reuses the tmux session, Fork tab and IntelliJ window of a folder.
+open_workspace() {
+	local worktree="$1" session="$2"
+
+	# tmux session
 
 	if tmux has-session -t "=$session" 2>/dev/null; then
 		echo "Reusing tmux session $session"
@@ -346,7 +358,7 @@ start() {
 		tmux select-pane -t "=$session:.0"
 	fi
 
-	# 3. Fork, then IntelliJ last
+	# Fork, then IntelliJ last
 
 	fork -C "$worktree" open >/dev/null 2>&1 || echo "ts: could not open Fork" >&2
 	idea "$worktree" >/dev/null 2>&1 &
@@ -361,6 +373,7 @@ start() {
 case "${1:-}" in
 	"") pick ;;
 	fetch) fetch ;;
+	master) open_workspace "$MAIN_REPO" master ;;
 	open) open_ticket "${2:-}" ;;
 	clean) clean ;;
 	healthcheck) healthcheck ;;

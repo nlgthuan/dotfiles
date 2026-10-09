@@ -45,7 +45,8 @@ vim.api.nvim_create_autocmd('TextYankPost', {
   end,
 })
 
-vim.lsp.enable({ "lua_ls", "ts_ls", "oxlint", "pyright", "gopls", "postgres_lsp", "texlab", "jdtls", "hls", "clangd" })
+vim.lsp.enable({ "lua_ls", "ts_ls", "oxlint", "pyright", "gopls", "postgres_lsp", "texlab", "jdtls", "hls", "clangd",
+  "tailwindcss" })
 
 -- [[ Plugins ]]
 vim.pack.add({

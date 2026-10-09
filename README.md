@@ -53,13 +53,14 @@ The `install.sh` script manages symbolic links from `~/dotfiles` into home direc
 
 ## ZSH plugins
 
-No framework; `.zshrc` sources plain git clones from `~/.local/share/zsh/plugins`:
+No framework; `.zshrc` sources plain git clones from `~/.local/share/zsh/plugins`.
+On a new machine, run once:
 
 ```bash
-mkdir -p ~/.local/share/zsh/plugins && cd ~/.local/share/zsh/plugins
-git clone https://github.com/aloxaf/fzf-tab
-git clone https://github.com/zdharma-continuum/fast-syntax-highlighting
-git clone https://github.com/zsh-users/zsh-autosuggestions
+mkdir -p ~/.cache/zsh ~/.local/share/zsh/plugins
+for repo in Aloxaf/fzf-tab zsh-users/zsh-autosuggestions zdharma-continuum/fast-syntax-highlighting; do
+  git clone --depth 1 "https://github.com/$repo" ~/.local/share/zsh/plugins/"${repo#*/}"
+done
 ```
 
 Update with `for p in ~/.local/share/zsh/plugins/*; do git -C "$p" pull; done`.

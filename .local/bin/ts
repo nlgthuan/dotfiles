@@ -22,6 +22,8 @@ WORKTREES_DIR="$TS_ROOT/worktrees"
 JIRA_URL="${JIRA_URL:-https://cqse.atlassian.net}"
 JIRA_JQL="${JIRA_JQL:-assignee = currentUser() AND project = TS AND status in (Backlog, \"In Development\", \"In Review\", Rework) ORDER BY updated DESC}"
 TICKETS_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/ts/tickets.tsv"
+TODAY_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/ts/today.tsv"
+TODAY_TTL="${TS_TODAY_TTL:-300}"
 REQUIRED_TOOLS=(git tmux fzf jq curl idea fork)
 
 die() { echo "ts: $*" >&2; exit 1; }
@@ -45,6 +47,12 @@ Commands:
                     $TICKETS_FILE
   open [ticket]     open the ticket in the browser (default: the ticket of the
                     current worktree's branch)
+  time [days]       list the time you logged per day and ticket over the last
+                    <days> days, today included (default: 7)
+  today [--tmux]    print the total time you logged today, e.g. "3h 15m";
+                    --tmux prints the cached total instead, with its age dimmed
+                    (e.g. "3h 15m ↻4m"), and refreshes it in the background
+                    once it is older than TS_TODAY_TTL seconds (default: 300)
   clean             pick worktrees to remove, together with their branch and
                     tmux session
   healthcheck       check required tools, repository and Jira credentials
@@ -186,6 +194,124 @@ open_ticket() {
 		key="TS-${BASH_REMATCH[1]}"
 	fi
 	open "$JIRA_URL/browse/$key"
+}
+
+# --- time --------------------------------------------------------------------
+
+# Prints "<day>\t<key>\t<seconds>\t<summary>" for each worklog you logged since <since> (YYYY-MM-DD).
+worklog_records() {
+	local since="$1"
+	require_jira_credentials
+
+	local since_ms me
+	since_ms=$(($(date -j -f '%Y-%m-%d %H:%M:%S' "$since 00:00:00" +%s) * 1000))
+	me=$(jira_curl -fsS "$JIRA_URL/rest/api/3/myself" | jq -r '.accountId') \
+		|| die "Jira request failed; run 'ts healthcheck'"
+
+	local response
+	response=$(jira_curl -fsS \
+		-H 'Content-Type: application/json' \
+		-X POST "$JIRA_URL/rest/api/3/search/jql" \
+		-d "$(jq -n --arg jql "worklogAuthor = currentUser() AND worklogDate >= \"$since\" ORDER BY key" \
+			'{jql: $jql, fields: ["summary", "worklog"], maxResults: 100}')") \
+		|| die "Jira request failed; run 'ts healthcheck'"
+
+	# Prints "<day>\t<key>\t<seconds>\t<summary>" for each of my worklogs since $since.
+	local my_worklogs='.[] | select(.author.accountId == $me and .started[0:10] >= $since)
+		| [(.started[0:10] | strptime("%Y-%m-%d") | mktime | strftime("%a %Y-%m-%d")), $key, .timeSpentSeconds, $summary]
+		| @tsv'
+
+	# The search includes at most 20 worklogs per ticket; fetch the rest separately.
+	local records incomplete key summary
+	records=$(jq -r --arg me "$me" --arg since "$since" '.issues[]
+		| select(.fields.worklog.total <= (.fields.worklog.worklogs | length))
+		| .key as $key | .fields.summary as $summary | .fields.worklog.worklogs | '"$my_worklogs" <<<"$response")
+	incomplete=$(jq -r '.issues[]
+		| select(.fields.worklog.total > (.fields.worklog.worklogs | length))
+		| [.key, .fields.summary] | @tsv' <<<"$response")
+	while IFS=$'\t' read -r key summary; do
+		[[ -n "$key" ]] || continue
+		records+=$'\n'$(jira_curl -fsS "$JIRA_URL/rest/api/3/issue/$key/worklog?startedAfter=$since_ms" \
+			| jq -r --arg me "$me" --arg since "$since" --arg key "$key" --arg summary "$summary" \
+				'.worklogs | '"$my_worklogs") || die "could not fetch the worklogs of $key"
+	done <<<"$incomplete"
+
+	grep -v '^$' <<<"$records" || true
+}
+
+# Lists the time you logged per day and ticket over the last <days> days, today included.
+worklog() {
+	local days="${1:-7}"
+	[[ "$days" =~ ^[0-9]+$ ]] && ((days > 0)) || die "not a number of days: $days"
+
+	local since records
+	since=$(date -v-"$((days - 1))"d +%Y-%m-%d)
+	records=$(worklog_records "$since") || exit 1
+	[[ -n "$records" ]] || { echo "No time logged since $since."; return 0; }
+
+	sort -t$'\t' -k1.5,1 -k2,2 <<<"$records" | awk -F'\t' '
+		function duration(s) { return sprintf("%2dh %02dm", int(s / 3600), int(s % 3600 / 60)) }
+		function end_ticket() {
+			if (key == "") return
+			lines = lines sprintf("  %-9s %s  %s\n", key, duration(ticket_sum), summary)
+			day_sum += ticket_sum
+		}
+		function end_day() {
+			end_ticket()
+			if (day == "") return
+			printf "%s%s  %s\n%s", (total ? "\n" : ""), day, duration(day_sum), lines
+			total += day_sum
+		}
+		$1 != day { end_day(); day = $1; key = ""; lines = ""; day_sum = 0 }
+		$2 != key { end_ticket(); key = $2; summary = $4; ticket_sum = 0 }
+		{ ticket_sum += $3 }
+		END { end_day(); printf "\nTotal          %s\n", duration(total) }'
+}
+
+# Prints the total time you logged today, e.g. "3h 15m", and stores it as
+# "<fetched epoch>\t<day>\t<total>" in $TODAY_FILE.
+today() {
+	local fetched day records total
+	read -r fetched day < <(date '+%s %Y-%m-%d')
+	records=$(worklog_records "$day") || exit 1
+	total=$(awk -F'\t' '{ s += $3 } END { printf "%dh %02dm", int(s / 3600), int(s % 3600 / 60) }' <<<"$records")
+
+	mkdir -p "$(dirname "$TODAY_FILE")"
+	printf '%s\t%s\t%s\n' "$fetched" "$day" "$total" >"$TODAY_FILE.tmp"
+	mv "$TODAY_FILE.tmp" "$TODAY_FILE"
+	echo "$total"
+}
+
+# For the tmux status bar: prints the stored total of today with its dimmed age, e.g.
+# "3h 15m ↻4m", or a dimmed "…" until there is one. Once it is older than $TODAY_TTL
+# seconds, starts a refresh in the background; failed refreshes are retried after the
+# same delay. Spawns only `date` otherwise, as this runs every few seconds.
+today_tmux() {
+	local now day fetched=0 stored_day="" total="" attempted=0
+	read -r now day < <(date '+%s %Y-%m-%d')
+	[[ -f "$TODAY_FILE" ]] && IFS=$'\t' read -r fetched stored_day total <"$TODAY_FILE"
+	[[ -f "$TODAY_FILE.attempt" ]] && read -r attempted <"$TODAY_FILE.attempt"
+
+	if [[ "$stored_day" != "$day" ]] || ((now - fetched >= TODAY_TTL)); then
+		if ((now - attempted >= TODAY_TTL)); then
+			mkdir -p "$(dirname "$TODAY_FILE")"
+			echo "$now" >"$TODAY_FILE.attempt"
+			# Detached from tmux's pipe, so tmux does not wait for the fetch.
+			nohup "${BASH_SOURCE[0]}" today </dev/null >/dev/null 2>&1 &
+		fi
+	fi
+
+	if [[ "$stored_day" != "$day" ]]; then
+		echo '#[dim]…#[nodim]'
+		return 0
+	fi
+	local age=$(((now - fetched) / 60)) unit=m
+	if ((age >= 60 * 24)); then
+		age=$((age / 60 / 24)) unit=d
+	elif ((age >= 60)); then
+		age=$((age / 60)) unit=h
+	fi
+	echo "$total #[dim]↻$age$unit#[nodim]"
 }
 
 # --- clean -------------------------------------------------------------------
@@ -375,6 +501,14 @@ case "${1:-}" in
 	fetch) fetch ;;
 	master) open_workspace "$MAIN_REPO" master ;;
 	open) open_ticket "${2:-}" ;;
+	time) worklog "${2:-}" ;;
+	today)
+		case "${2:-}" in
+			"") today ;;
+			--tmux) today_tmux ;;
+			*) die "unknown option for today: $2" ;;
+		esac
+		;;
 	clean) clean ;;
 	healthcheck) healthcheck ;;
 	help | -h | --help) usage ;;
